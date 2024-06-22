@@ -1,0 +1,223 @@
+import json
+import paramiko
+import boto3
+import logging
+from botocore.exceptions import ClientError
+
+# Configure logging
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+
+def lambda_handler(event, context):
+    # The service ID to stop
+    service_id = "abc"
+    
+    # SSH login details
+    port = 22
+    secret_name = "your_secret_name"  # The name of the secret in Secrets Manager
+
+    # Get the instances from the event
+    instances = event.get('Instances')
+    if not instances:
+        return {
+            'statusCode': 400,
+            'body': json.dumps({
+                'error': 'Instances data is required'
+            })
+        }
+
+    # Retrieve SSH credentials from AWS Secrets Manager
+    try:
+        username, password = fetch_secret(secret_name)
+        logger.info("Retrieved secrets from Secrets Manager")
+    except Exception as e:
+        logger.error(f"Failed to retrieve secrets from Secrets Manager: {e}")
+        return {
+            'statusCode': 500,
+            'body': json.dumps({
+                'error': 'Failed to retrieve secrets from Secrets Manager',
+                'details': str(e)
+            })
+        }
+
+    # Create an EC2 client
+    ec2 = boto3.client('ec2')
+    
+    # Iterate over each instance, stop the service, and then stop the instance
+    results = []
+    for instance in instances:
+        hostname = instance['PublicDns']
+        instance_id = instance['InstanceId']
+        logger.info(f"Processing instance {hostname} with IP {instance['PublicIp']}")
+        
+        service_result = stop_service_on_instance(hostname, port, username, password, service_id)
+        logger.info(f"Service stop result for instance {hostname}: {service_result}")
+        
+        stop_instance_result = stop_ec2_instance(ec2, instance_id, hostname)
+        logger.info(f"EC2 stop result for instance {hostname}: {stop_instance_result}")
+        
+        results.append({
+            'InstanceId': instance_id,
+            'PublicIp': instance['PublicIp'],
+            'PublicDns': hostname,
+            'ServiceResult': service_result,
+            'StopInstanceResult': stop_instance_result
+        })
+    
+    return {
+        'statusCode': 200,
+        'body': json.dumps(results)
+    }
+
+def stop_service_on_instance(hostname, port, username, password, service_id):
+    # SSH command to stop the service
+    command = f"sudo systemctl stop {service_id}"
+    
+    try:
+        # Create an SSH client
+        ssh = paramiko.SSHClient()
+        ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        
+        # Connect to the server
+        ssh.connect(hostname, port, username, password=password)
+        logger.info(f"Connected to {hostname} via SSH")
+        
+        # Execute the command
+        stdin, stdout, stderr = ssh.exec_command(command)
+        
+        # Fetch the output and errors
+        output = stdout.read().decode()
+        error = stderr.read().decode()
+        
+        # Close the connection
+        ssh.close()
+        logger.info(f"Executed command on {hostname}: {command}")
+        
+        return {
+            'output': output,
+            'error': error
+        }
+        
+    except Exception as e:
+        logger.error(f"Failed to execute command on {hostname}: {e}")
+        return {
+            'error': str(e)
+        }
+
+def stop_ec2_instance(ec2, instance_id, hostname):
+    try:
+        # Stop the instance
+        ec2.stop_instances(InstanceIds=[instance_id])
+        logger.info(f"Initiated stop for instance {hostname}")
+        
+        # Use waiter to wait until the instance is stopped
+        waiter = ec2.get_waiter('instance_stopped')
+        waiter.wait(InstanceIds=[instance_id])
+        logger.info(f"Instance {hostname} has been stopped")
+        
+        return {
+            'status': 'stopped'
+        }
+    except ClientError as e:
+        logger.error(f"Failed to stop instance {hostname}: {e}")
+        return {
+            'error': str(e)
+        }
+
+
+import boto3
+from botocore.exceptions import ClientError
+import json
+
+def fetch_secret(secret_name):
+    # Retrieve the secret
+    session = boto3.session.Session()
+    client = session.client(service_name='secretsmanager')
+    
+    try:
+        get_secret_value_response = client.get_secret_value(
+            SecretId=secret_name
+        )
+        
+        secret = get_secret_value_response['SecretString']
+        secret_dict = json.loads(secret)
+        username = secret_dict['username']
+        password = secret_dict['password']
+        
+        return username, password
+    except ClientError as e:
+        raise Exception(f"Failed to retrieve secrets from Secrets Manager: {e}")
+
+
+import boto3
+import logging
+from botocore.exceptions import ClientError
+
+# Configure logging
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+
+def get_instances_from_asg(auto_scaling_group_name):
+    # Create an Auto Scaling client
+    autoscaling = boto3.client('autoscaling')
+    
+    # Describe the Auto Scaling group to get instance IDs
+    try:
+        response = autoscaling.describe_auto_scaling_groups(
+            AutoScalingGroupNames=[auto_scaling_group_name]
+        )
+        logger.info(f"Describe Auto Scaling groups response: {response}")
+    except ClientError as e:
+        logger.error(f"Failed to describe Auto Scaling groups: {e}")
+        return {
+            'error': 'Failed to describe Auto Scaling groups',
+            'details': str(e)
+        }
+
+    # Extract the instance IDs
+    instance_ids = []
+    for group in response['AutoScalingGroups']:
+        for instance in group['Instances']:
+            instance_ids.append(instance['InstanceId'])
+    
+    if not instance_ids:
+        logger.warning("No instances found in the specified Auto Scaling group")
+        return {
+            'error': 'No instances found in the specified Auto Scaling group'
+        }
+
+    # Create an EC2 client
+    ec2 = boto3.client('ec2')
+    
+    # Describe instances to get public IP addresses and DNS names
+    try:
+        response = ec2.describe_instances(
+            InstanceIds=instance_ids
+        )
+        logger.info(f"Describe instances response: {response}")
+    except ClientError as e:
+        logger.error(f"Failed to describe instances: {e}")
+        return {
+            'error': 'Failed to describe instances',
+            'details': str(e)
+        }
+
+    # Extract the instance IDs, public IP addresses, and DNS names
+    instances = []
+    for reservation in response['Reservations']:
+        for instance in reservation['Instances']:
+            instance_id = instance['InstanceId']
+            public_ip = instance.get('PublicIpAddress')
+            public_dns = instance.get('PublicDnsName')
+            if public_ip and public_dns:
+                instances.append({'InstanceId': instance_id, 'PublicIp': public_ip, 'PublicDns': public_dns})
+    
+    if not instances:
+        logger.warning("No instances found with public IP and DNS name")
+        return {
+            'error': 'No instances found with public IP and DNS name'
+        }
+
+    return instances
+
+
