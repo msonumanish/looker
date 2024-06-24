@@ -1,34 +1,70 @@
-
 import boto3
 
 def lambda_handler(event, context):
-    # Initialize the Auto Scaling client
-    client = boto3.client('autoscaling')
+    # Initialize the Auto Scaling and Service Catalog clients
+    autoscaling_client = boto3.client('autoscaling')
+    servicecatalog_client = boto3.client('servicecatalog')
     
     # Extract parameters from the event
     asg_name = event['asg_name']
     max_size = event['max_size']
     min_size = event['min_size']
     desired_capacity = event['desired_capacity']
+    product_name = event['product_name']
     
     try:
-        # Update the Auto Scaling Group
-        response = client.update_auto_scaling_group(
+        # Get the provisioned product ID based on the product name
+        response = servicecatalog_client.search_provisioned_products(
+            Filters={'SearchQuery': [f'name:{product_name}']}
+        )
+        provisioned_product_id = response['ProvisionedProducts'][0]['Id']
+        
+        # Get the details of the provisioned product
+        provisioned_product_details = servicecatalog_client.describe_provisioned_product(
+            Id=provisioned_product_id
+        )
+        provisioned_product_arn = provisioned_product_details['ProvisionedProductDetail']['Arn']
+        
+        # Update the Auto Scaling Group parameters
+        response = autoscaling_client.update_auto_scaling_group(
             AutoScalingGroupName=asg_name,
             MaxSize=max_size,
             MinSize=min_size,
             DesiredCapacity=desired_capacity
         )
         
+        # Prepare the parameters for Service Catalog update
+        parameters = [
+            {
+                'Key': 'MaxSize',
+                'Value': str(max_size)
+            },
+            {
+                'Key': 'MinSize',
+                'Value': str(min_size)
+            },
+            {
+                'Key': 'DesiredCapacity',
+                'Value': str(desired_capacity)
+            }
+        ]
+        
+        # Update the Service Catalog provisioned product
+        response = servicecatalog_client.update_provisioned_product(
+            ProvisionedProductId=provisioned_product_id,
+            UpdateToken='unique-token',  # Ensure this is a unique token for idempotency
+            ProvisioningParameters=parameters
+        )
+        
         # Return a success message
         return {
             'statusCode': 200,
-            'body': f'Successfully updated ASG {asg_name} to max_size={max_size}, min_size={min_size}, desired_capacity={desired_capacity}'
+            'body': f'Successfully updated ASG {asg_name} and Service Catalog product {product_name}'
         }
     
     except Exception as e:
         # Return an error message if something goes wrong
         return {
             'statusCode': 500,
-            'body': f'Error updating ASG: {str(e)}'
+            'body': f'Error updating ASG or Service Catalog product: {str(e)}'
         }
